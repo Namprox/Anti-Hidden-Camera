@@ -6,6 +6,7 @@ import 'package:lan_scanner/lan_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../core/threat/threat_analyzer.dart';
 import '../core/report/scan_session_store.dart';
+import '../utils/oui_helper.dart';
 
 class LanScannerScreen extends StatefulWidget {
   const LanScannerScreen({super.key});
@@ -28,6 +29,49 @@ class _LanScannerScreenState extends State<LanScannerScreen> {
   // Threat Analyzer Integration
   final Map<String, ThreatScore> _threatScores = {};
   final Map<String, DateTime> _lastAnalyzedAt = {};
+
+  // Hàm đọc bảng ARP nội bộ của hệ điều hành để tra MAC từ IP
+  Future<String?> _getMacFromIp(String targetIp) async {
+    try {
+      if (Platform.isAndroid || Platform.isLinux) {
+        // Đọc file cấu hình ARP table trên Android/Linux
+        final result = await Process.run('cat', ['/proc/net/arp']);
+        final lines = result.stdout.toString().split('\n');
+
+        for (var line in lines) {
+          if (line.contains(targetIp)) {
+            final parts = line.split(RegExp(r'\s+'));
+            if (parts.length >= 4) {
+              final mac = parts[3].toUpperCase();
+              // Bỏ qua MAC ảo hoặc chưa phân giải kịp
+              if (mac != '00:00:00:00:00:00') {
+                return mac;
+              }
+            }
+          }
+        }
+      } else if (Platform.isMacOS || Platform.isWindows) {
+        // Lệnh arp -a trên Win/Mac
+        final result = await Process.run('arp', ['-a']);
+        final lines = result.stdout.toString().split('\n');
+
+        for (var line in lines) {
+          if (line.contains(targetIp)) {
+            final RegExp macRegex = RegExp(
+              r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})',
+            );
+            final match = macRegex.firstMatch(line);
+            if (match != null) {
+              return match.group(0)?.replaceAll('-', ':').toUpperCase();
+            }
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Lỗi đọc bảng ARP: $e');
+    }
+    return null;
+  }
 
   // Quét nhanh (ICMP PING)
   Future<void> _scanLan() async {
@@ -156,7 +200,8 @@ class _LanScannerScreenState extends State<LanScannerScreen> {
   Future<void> _checkStealthDevice(String ip, List<int> ports) async {
     List<int> openPorts = [];
 
-    for (int port in ports) {
+    // Tối ưu hóa: Quét song song các cổng để tiết kiệm thời gian
+    List<Future<void>> portTasks = ports.map((port) async {
       try {
         final socket = await Socket.connect(
           ip,
@@ -165,14 +210,29 @@ class _LanScannerScreenState extends State<LanScannerScreen> {
         );
         openPorts.add(port);
         socket.destroy();
-      } catch (e) {
-        // Cổng đóng hoặc ko có thiết bị
-      }
-    }
+      } catch (e) {}
+    }).toList();
+
+    await Future.wait(portTasks);
 
     // Nếu có cổng mở -> Lột mặt nạ thiết bị tàng hình
     if (openPorts.isNotEmpty) {
-      final ThreatScore threatScore = _calculateThreatScore(ip, openPorts);
+      // Đọc MAC từ bảng ARP
+      final String? mac = await _getMacFromIp(ip);
+      String vendor = "Không xác định";
+      if (mac != null) {
+        vendor = OuiHelper.lookup(mac);
+      }
+
+      final ThreatScore threatScore = ThreatAnalyzer.analyzeDevice(
+        ThreatDeviceInput(
+          deviceId: ip,
+          ipAddress: ip,
+          macAddress: mac,
+          vendor: vendor,
+          openPorts: openPorts,
+        ),
+      );
 
       // Cập nhật vào ScanSessionStore
       ScanSessionStore.instance.upsertLan(
@@ -234,7 +294,8 @@ class _LanScannerScreenState extends State<LanScannerScreen> {
     List<int> cameraPorts = [554, 80, 81, 8080, 1935, 5000, 8000, 37777, 8999];
     List<int> openPorts = [];
 
-    for (int port in cameraPorts) {
+    // Tối ưu hóa: Quét song song các cổng mạng
+    List<Future<void>> portTasks = cameraPorts.map((port) async {
       try {
         final socket = await Socket.connect(
           ip,
@@ -244,9 +305,26 @@ class _LanScannerScreenState extends State<LanScannerScreen> {
         openPorts.add(port);
         socket.destroy();
       } catch (e) {}
+    }).toList();
+
+    await Future.wait(portTasks);
+
+    // Đọc MAC Address từ bảng ARP để phát hiện Camera Cloud
+    final String? mac = await _getMacFromIp(ip);
+    String vendor = "Không xác định";
+    if (mac != null) {
+      vendor = OuiHelper.lookup(mac);
     }
 
-    final ThreatScore threatScore = _calculateThreatScore(ip, openPorts);
+    final ThreatScore threatScore = ThreatAnalyzer.analyzeDevice(
+      ThreatDeviceInput(
+        deviceId: ip,
+        ipAddress: ip,
+        macAddress: mac,
+        vendor: vendor,
+        openPorts: openPorts,
+      ),
+    );
 
     // Cập nhật vào ScanSessionStore
     ScanSessionStore.instance.upsertLan(
@@ -271,12 +349,6 @@ class _LanScannerScreenState extends State<LanScannerScreen> {
         _analyzingStatus[ip] = false;
       });
     }
-  }
-
-  ThreatScore _calculateThreatScore(String ip, List<int> openPorts) {
-    return ThreatAnalyzer.analyzeDevice(
-      ThreatDeviceInput(deviceId: ip, ipAddress: ip, openPorts: openPorts),
-    );
   }
 
   String _labelFromThreatScore({
